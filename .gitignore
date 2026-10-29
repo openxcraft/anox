@@ -1,0 +1,9 @@
+# idea engine — published results only
+# internal engine operation (code, logs, manifests, memory) is never published
+.secrets/
+credentials*
+*.token
+*.secret
+__pycache__/
+*.pyc
+.DS_Store
