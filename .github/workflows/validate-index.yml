@@ -1,0 +1,107 @@
+name: Research index validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate index and record files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Validate JSONL, record paths, front matter, and README snapshot
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          index_path = Path("index.jsonl")
+          readme_path = Path("README.md")
+          if not index_path.is_file() or not readme_path.is_file():
+              sys.exit("index.jsonl and README.md are required")
+
+          required = {
+              "id", "title", "domain", "tags", "created_at",
+              "source_channels", "hypothesis", "test_method",
+              "score", "status", "rounds",
+          }
+          records = []
+          seen_ids = set()
+          for line_number, raw in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
+              if not raw.strip():
+                  continue
+              try:
+                  item = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  sys.exit(f"index.jsonl:{line_number}: invalid JSON: {exc}")
+              if not isinstance(item, dict):
+                  sys.exit(f"index.jsonl:{line_number}: each line must be a JSON object")
+              missing = required - item.keys()
+              if missing:
+                  sys.exit(f"index.jsonl:{line_number}: missing fields: {', '.join(sorted(missing))}")
+              if not isinstance(item["id"], str) or not item["id"].strip():
+                  sys.exit(f"index.jsonl:{line_number}: id must be a non-empty string")
+              if item["id"] in seen_ids:
+                  sys.exit(f"index.jsonl:{line_number}: duplicate id {item['id']}")
+              seen_ids.add(item["id"])
+              if not isinstance(item["domain"], str) or not re.fullmatch(r"[a-z0-9_]+", item["domain"]):
+                  sys.exit(f"index.jsonl:{line_number}: domain must be a lowercase slug")
+              if not isinstance(item["tags"], list) or not all(isinstance(v, str) for v in item["tags"]):
+                  sys.exit(f"index.jsonl:{line_number}: tags must be an array of strings")
+              if not isinstance(item["source_channels"], list) or not all(isinstance(v, str) for v in item["source_channels"]):
+                  sys.exit(f"index.jsonl:{line_number}: source_channels must be an array of strings")
+              if not isinstance(item["score"], (int, float)) or not 0 <= item["score"] <= 100:
+                  sys.exit(f"index.jsonl:{line_number}: score must be between 0 and 100")
+              if not isinstance(item["rounds"], int) or item["rounds"] < 1:
+                  sys.exit(f"index.jsonl:{line_number}: rounds must be a positive integer")
+              for key in ("title", "created_at", "hypothesis", "test_method", "status"):
+                  if not isinstance(item[key], str) or not item[key].strip():
+                      sys.exit(f"index.jsonl:{line_number}: {key} must be a non-empty string")
+              records.append(item)
+
+          expected_paths = set()
+          for item in records:
+              path = Path("ideas") / item["domain"] / f'{item["id"]}.md'
+              if not path.is_file():
+                  sys.exit(f"index entry {item['id']} has no record file at {path}")
+              expected_paths.add(path.as_posix())
+              content = path.read_text(encoding="utf-8")
+              if not content.startswith("---\n"):
+                  sys.exit(f"{path}: YAML front matter must start at the first line")
+              front_matter = content.split("---", 2)[1]
+              id_match = re.search(r"^id:\s*(\S+)\s*$", front_matter, re.MULTILINE)
+              domain_match = re.search(r"^domain:\s*(\S+)\s*$", front_matter, re.MULTILINE)
+              if not id_match or id_match.group(1) != item["id"]:
+                  sys.exit(f"{path}: front-matter id does not match index")
+              if not domain_match or domain_match.group(1) != item["domain"]:
+                  sys.exit(f"{path}: front-matter domain does not match index")
+
+          actual_paths = {p.as_posix() for p in Path("ideas").rglob("*.md")}
+          orphaned = sorted(actual_paths - expected_paths)
+          if orphaned:
+              sys.exit("record files missing from index.jsonl: " + ", ".join(orphaned))
+
+          readme = readme_path.read_text(encoding="utf-8")
+          total_match = re.search(r"^\|\s*total records\s*\|\s*(\d+)\s*\|$", readme, re.MULTILINE)
+          if not total_match or int(total_match.group(1)) != len(records):
+              sys.exit(f"README total-record snapshot must equal {len(records)}")
+          domain_match = re.search(r"^\|\s*domains\s*\|\s*(.*?)\s*\|$", readme, re.MULTILINE)
+          if not domain_match:
+              sys.exit("README must include a domains snapshot row")
+          reported = {name: int(count) for name, count in re.findall(r"([a-z0-9_]+)\s*\((\d+)\)", domain_match.group(1))}
+          actual = dict(Counter(item["domain"] for item in records))
+          if reported != actual:
+              sys.exit(f"README domain snapshot is stale; expected {actual}, found {reported}")
+
+          print(f"Validated {len(records)} JSONL records, unique IDs, matching front matter and file paths, no orphaned records, and README counts.")
+          PY
